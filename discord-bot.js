@@ -179,14 +179,15 @@ function createDiscordBot({ supabase }) {
 
   async function publishPanel(interaction) {
     const channelId = interaction.fields.getTextInputValue('channel_id').trim();
+    await interaction.deferReply({ ephemeral: true });
     const channel = await interaction.guild.channels.fetch(channelId);
-    if (!channel || !channel.isTextBased() || !channel.send) return interaction.reply({ content: 'ไม่พบห้องข้อความนี้ หรือบอทส่งข้อความในห้องไม่ได้', ephemeral: true });
+    if (!channel || !channel.isTextBased() || !channel.send) return interaction.editReply({ content: 'ไม่พบห้องข้อความนี้ หรือบอทส่งข้อความในห้องไม่ได้' });
     const { error: saveError } = await supabase.from('discord_settings').upsert({ id: 1, verify_channel_id: channelId, updated_at: new Date().toISOString() }, { onConflict: 'id' });
     if (saveError) throw saveError;
     const message = await channel.send(verifyPanel());
     const { error: updateError } = await supabase.from('discord_settings').update({ verify_message_id: message.id, updated_at: new Date().toISOString() }).eq('id', 1);
     if (updateError) throw updateError;
-    return interaction.reply({ content: `โพสต์ปุ่ม Verify แล้วใน ${channel}`, ephemeral: true });
+    return interaction.editReply({ content: `โพสต์ปุ่ม Verify แล้วใน ${channel}` });
   }
 
   async function saveGuide(interaction, lang, step) {
@@ -194,11 +195,12 @@ function createDiscordBot({ supabase }) {
     const body = interaction.fields.getTextInputValue('body').trim();
     const imageUrl = interaction.fields.getTextInputValue('image_url').trim();
     if (imageUrl && !/^https:\/\//i.test(imageUrl)) return interaction.reply({ content: 'Image URL ต้องขึ้นต้นด้วย https://', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
     const { error } = await supabase.from('discord_verification_guides').upsert({
       language: lang, step, title, body, image_url: imageUrl || null, updated_at: new Date().toISOString()
     }, { onConflict: 'language,step' });
     if (error) throw error;
-    return interaction.reply({ content: `บันทึกคู่มือ ${lang.toUpperCase()} ขั้น ${step}/3 แล้ว`, ephemeral: true });
+    return interaction.editReply({ content: `บันทึกคู่มือ ${lang.toUpperCase()} ขั้น ${step}/3 แล้ว` });
   }
 
   async function showGuides(interaction, lang) {
@@ -221,6 +223,7 @@ function createDiscordBot({ supabase }) {
     const english = lang === 'en';
     if (!/^7656119\d{10}$/.test(steamId)) return interaction.reply({ content: english ? 'Enter a valid 17-digit SteamID64.' : 'กรุณาใส่ SteamID64 ตัวเลข 17 หลักให้ถูกต้อง', ephemeral: true });
     if (submittedDiscordId !== interaction.user.id) return interaction.reply({ content: english ? 'Discord ID must match your signed-in Discord account.' : 'Discord ID ต้องตรงกับบัญชี Discord ที่กำลังกดปุ่ม', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
 
     const { data: existing, error: existingError } = await supabase.from('whitelists').select('id,status').eq('steam_id', steamId).maybeSingle();
     if (existingError) throw existingError;
@@ -228,11 +231,11 @@ function createDiscordBot({ supabase }) {
       const message = existing.status === 'approved'
         ? (english ? 'This Steam account is already verified.' : 'SteamID นี้ได้รับอนุมัติแล้ว')
         : (english ? 'This Steam account is banned. Contact an administrator.' : 'SteamID นี้ถูกแบน กรุณาติดต่อแอดมิน');
-      return interaction.reply({ content: message, ephemeral: true });
+      return interaction.editReply({ content: message });
     }
     const { data: discordOwner, error: discordError } = await supabase.from('whitelists').select('steam_id').eq('discord_id', submittedDiscordId).limit(1).maybeSingle();
     if (discordError) throw discordError;
-    if (discordOwner && discordOwner.steam_id !== steamId) return interaction.reply({ content: english ? 'This Discord account is already linked to another Steam account.' : 'Discord นี้ผูกกับ SteamID อื่นแล้ว', ephemeral: true });
+    if (discordOwner && discordOwner.steam_id !== steamId) return interaction.editReply({ content: english ? 'This Discord account is already linked to another Steam account.' : 'Discord นี้ผูกกับ SteamID อื่นแล้ว' });
 
     const row = {
       steam_id: steamId,
@@ -246,11 +249,10 @@ function createDiscordBot({ supabase }) {
       ? await supabase.from('whitelists').update(row).eq('steam_id', steamId).select('id').single()
       : await supabase.from('whitelists').insert(row).select('id').single();
     if (result.error) throw result.error;
-    return interaction.reply({
+    return interaction.editReply({
       content: english
         ? 'Verification submitted. Your status is Pending; an administrator must approve it before the launcher can access the game.'
-        : 'ส่งข้อมูลยืนยันแล้ว สถานะ Pending รอแอดมินอนุมัติ จากนั้น Launcher จึงจะเข้าเกมได้',
-      ephemeral: true
+        : 'ส่งข้อมูลยืนยันแล้ว สถานะ Pending รอแอดมินอนุมัติ จากนั้น Launcher จึงจะเข้าเกมได้'
     });
   }
 }
