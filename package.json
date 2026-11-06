@@ -1,0 +1,15 @@
+{
+  "name": "hsh-sovereign-soul-discord-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone HSH SovereignSoul verification and guide Discord bot",
+  "main": "bot-server.js",
+  "scripts": { "start": "node bot-server.js" },
+  "engines": { "node": ">=24.17.0" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0"
+  }
+}
