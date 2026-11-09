@@ -54,15 +54,18 @@ function createDiscordBot({ supabase }) {
   const adminRoleIds = new Set((process.env.DISCORD_ADMIN_ROLE_IDS || '').split(',').map(x => x.trim()).filter(Boolean));
   const controlCommand = new SlashCommandBuilder().setName('control').setDescription('Open the HSH Verify and Guide control panel');
   const voiceControlCommand = new SlashCommandBuilder().setName('voice-control').setDescription('Configure the HSH Join-to-Create voice room');
-  const communityControlCommand = new SlashCommandBuilder().setName('community-control').setDescription('Configure welcome, goodbye, and auto-ban channels');
+  const communityControlCommand = new SlashCommandBuilder().setName('community-control').setDescription('Configure the spam-trap auto-ban channel');
+  const welcomeControlCommand = new SlashCommandBuilder().setName('welcome-control').setDescription('Configure the welcome channel, message, and image');
+  const goodbyeControlCommand = new SlashCommandBuilder().setName('goodbye-control').setDescription('Configure the goodbye channel, message, and image');
 
   client.once('ready', async () => {
     try {
       const rest = new REST({ version: '10' }).setToken(token);
       await rest.put(Routes.applicationGuildCommands(appId, guildId), { body: [
-        controlCommand.toJSON(), voiceControlCommand.toJSON(), communityControlCommand.toJSON()
+        controlCommand.toJSON(), voiceControlCommand.toJSON(), communityControlCommand.toJSON(),
+        welcomeControlCommand.toJSON(), goodbyeControlCommand.toJSON()
       ] });
-      console.log(`[Discord] Logged in as ${client.user.tag}; /control, /voice-control, and /community-control registered in guild ${guildId}.`);
+      console.log(`[Discord] Logged in as ${client.user.tag}; /control, /voice-control, /community-control, /welcome-control, and /goodbye-control registered in guild ${guildId}.`);
     } catch (error) {
       console.error('[Discord] Could not register /control:', error.message);
     }
@@ -189,12 +192,12 @@ function createDiscordBot({ supabase }) {
         await refreshRuntimeSettings();
         return interaction.reply({ content: 'HSH SovereignSoul • Verify Control', components: controlRows(), ephemeral: true });
       }
-      if (interaction.isChatInputCommand() && ['voice-control', 'community-control'].includes(interaction.commandName)) {
+      if (interaction.isChatInputCommand() && ['voice-control', 'community-control', 'welcome-control', 'goodbye-control'].includes(interaction.commandName)) {
         if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'คำสั่งนี้ใช้ได้เฉพาะเจ้าของเซิร์ฟเวอร์หรือแอดมินเท่านั้น', ephemeral: true });
         await refreshRuntimeSettings();
-        return interaction.showModal(interaction.commandName === 'voice-control'
-          ? voiceSettingsModal(runtimeSettings)
-          : communitySettingsModal(runtimeSettings));
+        if (interaction.commandName === 'voice-control') return interaction.showModal(voiceSettingsModal(runtimeSettings));
+        if (interaction.commandName === 'community-control') return interaction.showModal(autoBanSettingsModal(runtimeSettings));
+        return interaction.showModal(memberMessageModal(interaction.commandName === 'welcome-control' ? 'welcome' : 'goodbye', runtimeSettings));
       }
 
       if (interaction.isButton()) {
@@ -214,7 +217,7 @@ function createDiscordBot({ supabase }) {
         if (interaction.customId === `${PREFIX}control:publish`) return interaction.showModal(publishModal());
         if (interaction.customId === `${PREFIX}control:community`) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
-          return interaction.showModal(communitySettingsModal(runtimeSettings));
+          return interaction.showModal(autoBanSettingsModal(runtimeSettings));
         }
         if (interaction.customId === `${PREFIX}control:voice`) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
@@ -228,9 +231,13 @@ function createDiscordBot({ supabase }) {
       }
 
       if (interaction.isModalSubmit()) {
-        if (interaction.customId === `${PREFIX}community-settings`) {
+        if (interaction.customId === `${PREFIX}auto-ban-settings`) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
-          return saveCommunitySettings(interaction);
+          return saveAutoBanSettings(interaction);
+        }
+        if (interaction.customId === `${PREFIX}welcome-settings` || interaction.customId === `${PREFIX}goodbye-settings`) {
+          if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
+          return saveMemberMessageSettings(interaction, interaction.customId === `${PREFIX}welcome-settings` ? 'welcome' : 'goodbye');
         }
         if (interaction.customId === `${PREFIX}voice-settings`) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
@@ -277,7 +284,7 @@ function createDiscordBot({ supabase }) {
       new ButtonBuilder().setCustomId(`${PREFIX}control:voice`).setLabel('ตั้งค่า Join-to-Create').setStyle(ButtonStyle.Primary)
     )];
     rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`${PREFIX}control:community`).setLabel('ตั้งค่า Welcome / Goodbye / Auto-ban').setStyle(ButtonStyle.Success)
+      new ButtonBuilder().setCustomId(`${PREFIX}control:community`).setLabel('ตั้งค่า Auto-ban').setStyle(ButtonStyle.Success)
     ));
     for (const lang of ['th', 'en']) {
       for (let step = 1; step <= 3; step++) {
@@ -330,15 +337,19 @@ function createDiscordBot({ supabase }) {
       .addComponents(modalRow('channel_id', 'Channel ID ที่จะโพสต์ปุ่ม', TextInputStyle.Short, true, 'คลิกขวาห้อง > Copy Channel ID', 25));
   }
 
-  function communitySettingsModal(settings) {
-    return new ModalBuilder().setCustomId(`${PREFIX}community-settings`).setTitle('ตั้งค่าห้องและข้อความ')
+  function memberMessageModal(type, settings) {
+    const title = type === 'welcome' ? 'ตั้งค่า Welcome' : 'ตั้งค่า Goodbye';
+    return new ModalBuilder().setCustomId(`${PREFIX}${type}-settings`).setTitle(title)
       .addComponents(
-        modalRow('welcome_channel_id', 'Welcome Channel ID (ว่าง = ปิด)', TextInputStyle.Short, false, 'ID ห้องข้อความ', 25, settings.welcome_channel_id || ''),
-        modalRow('welcome_message', 'Welcome Message', TextInputStyle.Paragraph, false, 'เช่น ยินดีต้อนรับ {user} สู่ {server}!', 1000, settings.welcome_message || ''),
-        modalRow('goodbye_channel_id', 'Goodbye Channel ID (ว่าง = ปิด)', TextInputStyle.Short, false, 'ID ห้องข้อความ', 25, settings.goodbye_channel_id || ''),
-        modalRow('goodbye_message', 'Goodbye Message', TextInputStyle.Paragraph, false, 'เช่น {user} ออกจาก {server} แล้ว', 1000, settings.goodbye_message || ''),
-        modalRow('auto_ban_channel_id', 'Auto-ban Channel ID (ว่าง = ปิด)', TextInputStyle.Short, false, 'ID ห้องกับดักสแปม', 25, settings.auto_ban_channel_id || '')
+        modalRow('channel_id', 'Channel ID (เว้นว่างเพื่อปิด)', TextInputStyle.Short, false, 'ID ห้องข้อความ', 25, settings[`${type}_channel_id`] || ''),
+        modalRow('message', 'ข้อความ (รองรับ {user}, {server}, {memberCount})', TextInputStyle.Paragraph, false, type === 'welcome' ? 'ยินดีต้อนรับ {user} สู่ {server}!' : '{user} ออกจาก {server} แล้ว', 1000, settings[`${type}_message`] || ''),
+        modalRow('image_url', 'ลิงก์รูปภาพ HTTPS (ไม่ใส่ก็ได้)', TextInputStyle.Short, false, 'https://example.com/image.png', 500, settings[`${type}_image_url`] || '')
       );
+  }
+
+  function autoBanSettingsModal(settings) {
+    return new ModalBuilder().setCustomId(`${PREFIX}auto-ban-settings`).setTitle('ตั้งค่า Auto-ban')
+      .addComponents(modalRow('auto_ban_channel_id', 'Channel ID (ว่าง = ปิด Auto-ban)', TextInputStyle.Short, false, 'ID ห้องกับดักสแปม', 25, settings.auto_ban_channel_id || ''));
   }
 
   function voiceSettingsModal(settings) {
@@ -381,32 +392,44 @@ function createDiscordBot({ supabase }) {
       : 'ปิด Join-to-Create แล้ว (เว้น Channel ID ว่าง)' });
   }
 
-  async function saveCommunitySettings(interaction) {
+  async function saveMemberMessageSettings(interaction, type) {
+    const channelId = interaction.fields.getTextInputValue('channel_id').trim();
+    const message = interaction.fields.getTextInputValue('message').trim();
+    const imageUrl = interaction.fields.getTextInputValue('image_url').trim();
+    if (channelId && !/^\d{17,20}$/.test(channelId)) return interaction.reply({ content: 'Channel ID ต้องเป็นตัวเลข 17–20 หลัก หรือเว้นว่างเพื่อปิด', ephemeral: true });
+    if (imageUrl && !/^https:\/\//i.test(imageUrl)) return interaction.reply({ content: 'ลิงก์รูปภาพต้องขึ้นต้นด้วย https://', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    if (channelId) {
+      const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+      if (!channel?.isTextBased() || !channel.send) return interaction.editReply({ content: 'ไม่พบห้องข้อความ หรือบอทส่งข้อความในห้องนั้นไม่ได้' });
+    }
     const values = {
-      welcome_channel_id: interaction.fields.getTextInputValue('welcome_channel_id').trim(),
-      welcome_message: interaction.fields.getTextInputValue('welcome_message').trim(),
-      goodbye_channel_id: interaction.fields.getTextInputValue('goodbye_channel_id').trim(),
-      goodbye_message: interaction.fields.getTextInputValue('goodbye_message').trim(),
-      auto_ban_channel_id: interaction.fields.getTextInputValue('auto_ban_channel_id').trim(),
+      [`${type}_channel_id`]: channelId || null,
+      [`${type}_message`]: message || null,
+      [`${type}_image_url`]: imageUrl || null,
       updated_at: new Date().toISOString()
     };
-    for (const key of ['welcome_channel_id', 'goodbye_channel_id', 'auto_ban_channel_id']) {
-      if (values[key] && !/^\d{17,20}$/.test(values[key])) return interaction.reply({ content: `${key} ต้องเป็น Channel ID ตัวเลข 17–20 หลัก หรือเว้นว่างเพื่อปิด`, ephemeral: true });
-    }
-    await interaction.deferReply({ ephemeral: true });
-    for (const key of ['welcome_channel_id', 'goodbye_channel_id']) {
-      if (!values[key]) continue;
-      const channel = await interaction.guild.channels.fetch(values[key]).catch(() => null);
-      if (!channel?.isTextBased() || !channel.send) return interaction.editReply({ content: `ไม่พบห้องข้อความสำหรับ ${key} หรือบอทส่งข้อความในห้องนั้นไม่ได้` });
-    }
     await saveDiscordSettings(values);
     await refreshRuntimeSettings();
-    return interaction.editReply({ content: 'บันทึกแล้ว ข้อความรองรับ {user}, {server}, {memberCount}; เว้น Channel ID เพื่อปิดระบบนั้น' });
+    return interaction.editReply({ content: `บันทึกการตั้งค่า ${type === 'welcome' ? 'Welcome' : 'Goodbye'} แล้ว ข้อความรองรับ {user}, {server}, {memberCount}` });
+  }
+
+  async function saveAutoBanSettings(interaction) {
+    const channelId = interaction.fields.getTextInputValue('auto_ban_channel_id').trim();
+    if (channelId && !/^\d{17,20}$/.test(channelId)) return interaction.reply({ content: 'Channel ID ต้องเป็นตัวเลข 17–20 หลัก หรือเว้นว่างเพื่อปิด', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    if (channelId) {
+      const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+      if (!channel?.isTextBased() || !channel.send) return interaction.editReply({ content: 'ไม่พบห้องข้อความ หรือบอทเข้าถึงห้องนั้นไม่ได้' });
+    }
+    await saveDiscordSettings({ auto_ban_channel_id: channelId || null, updated_at: new Date().toISOString() });
+    await refreshRuntimeSettings();
+    return interaction.editReply({ content: channelId ? 'บันทึกห้อง Auto-ban แล้ว' : 'ปิด Auto-ban แล้ว' });
   }
 
   async function refreshRuntimeSettings() {
     const { data, error } = await supabase.from('discord_settings')
-      .select('auto_ban_channel_id,welcome_channel_id,welcome_message,goodbye_channel_id,goodbye_message,voice_lobby_channel_id,voice_category_id,voice_user_limit')
+      .select('auto_ban_channel_id,welcome_channel_id,welcome_message,welcome_image_url,goodbye_channel_id,goodbye_message,goodbye_image_url,voice_lobby_channel_id,voice_category_id,voice_user_limit')
       .eq('id', 1).maybeSingle();
     if (error) {
       console.error('[Discord] Could not load control settings:', error.message);
@@ -440,7 +463,10 @@ function createDiscordBot({ supabase }) {
       const text = template.replaceAll('{user}', `<@${member.id}>`)
         .replaceAll('{server}', member.guild.name)
         .replaceAll('{memberCount}', String(member.guild.memberCount));
-      await channel.send({ content: text, allowedMentions: { users: [member.id], parse: [] } });
+      const imageUrl = runtimeSettings[`${type}_image_url`];
+      const payload = { content: text, allowedMentions: { users: [member.id], parse: [] } };
+      if (imageUrl) payload.embeds = [new EmbedBuilder().setColor(0xc9a64d).setImage(imageUrl)];
+      await channel.send(payload);
     } catch (error) {
       console.error(`[Discord] Could not send ${type} message for ${member.id}:`, error.message);
     }
