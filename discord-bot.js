@@ -53,12 +53,16 @@ function createDiscordBot({ supabase }) {
   };
   const adminRoleIds = new Set((process.env.DISCORD_ADMIN_ROLE_IDS || '').split(',').map(x => x.trim()).filter(Boolean));
   const controlCommand = new SlashCommandBuilder().setName('control').setDescription('Open the HSH Verify and Guide control panel');
+  const voiceControlCommand = new SlashCommandBuilder().setName('voice-control').setDescription('Configure the HSH Join-to-Create voice room');
+  const communityControlCommand = new SlashCommandBuilder().setName('community-control').setDescription('Configure welcome, goodbye, and auto-ban channels');
 
   client.once('ready', async () => {
     try {
       const rest = new REST({ version: '10' }).setToken(token);
-      await rest.put(Routes.applicationGuildCommands(appId, guildId), { body: [controlCommand.toJSON()] });
-      console.log(`[Discord] Logged in as ${client.user.tag}; /control registered in guild ${guildId}.`);
+      await rest.put(Routes.applicationGuildCommands(appId, guildId), { body: [
+        controlCommand.toJSON(), voiceControlCommand.toJSON(), communityControlCommand.toJSON()
+      ] });
+      console.log(`[Discord] Logged in as ${client.user.tag}; /control, /voice-control, and /community-control registered in guild ${guildId}.`);
     } catch (error) {
       console.error('[Discord] Could not register /control:', error.message);
     }
@@ -184,6 +188,13 @@ function createDiscordBot({ supabase }) {
         if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'คำสั่งนี้ใช้ได้เฉพาะเจ้าของเซิร์ฟเวอร์หรือแอดมินเท่านั้น', ephemeral: true });
         await refreshRuntimeSettings();
         return interaction.reply({ content: 'HSH SovereignSoul • Verify Control', components: controlRows(), ephemeral: true });
+      }
+      if (interaction.isChatInputCommand() && ['voice-control', 'community-control'].includes(interaction.commandName)) {
+        if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'คำสั่งนี้ใช้ได้เฉพาะเจ้าของเซิร์ฟเวอร์หรือแอดมินเท่านั้น', ephemeral: true });
+        await refreshRuntimeSettings();
+        return interaction.showModal(interaction.commandName === 'voice-control'
+          ? voiceSettingsModal(runtimeSettings)
+          : communitySettingsModal(runtimeSettings));
       }
 
       if (interaction.isButton()) {
