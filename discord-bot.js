@@ -32,7 +32,8 @@ function createDiscordBot({ supabase }) {
   const client = new Client({ intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildVoiceStates
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers
   ] });
   const verifyMaxAttempts = positiveInt(process.env.DISCORD_VERIFY_MAX_ATTEMPTS, 8);
   const verifyWindowHours = positiveInt(process.env.DISCORD_VERIFY_WINDOW_HOURS, 24);
@@ -40,8 +41,10 @@ function createDiscordBot({ supabase }) {
   const spamWindowMs = positiveInt(process.env.DISCORD_SPAM_WINDOW_SECONDS, 5) * 1000;
   const spamTimeoutSteps = parseTimeoutSteps(process.env.DISCORD_SPAM_TIMEOUT_STEPS_SECONDS);
   const spamStrikeResetDays = positiveInt(process.env.DISCORD_SPAM_STRIKE_RESET_DAYS, 30);
+  let runtimeSettings = {};
   const messageWindows = new Map();
   const spamActionAt = new Map();
+  const autoBanActionAt = new Map();
   const managedVoiceRooms = new Set();
   client.sendWhitelistApprovedDM = async discordId => {
     if (!/^\d{17,20}$/.test(String(discordId || ''))) throw new Error('Discord ID is invalid');
@@ -62,6 +65,14 @@ function createDiscordBot({ supabase }) {
     if (!/^\d{17,20}$/.test(process.env.DISCORD_JOIN_TO_CREATE_CHANNEL_ID || '')) {
       console.log('[Voice] Join-to-create disabled; configure DISCORD_JOIN_TO_CREATE_CHANNEL_ID to a voice channel ID.');
     }
+    await refreshRuntimeSettings();
+  });
+
+  client.on('guildMemberAdd', async member => {
+    if (!member.user.bot) await sendConfiguredMemberMessage(member, 'welcome');
+  });
+  client.on('guildMemberRemove', async member => {
+    if (!member.user?.bot) await sendConfiguredMemberMessage(member, 'goodbye');
   });
 
   // Create a private-to-owner voice room when a member joins the configured lobby.
@@ -113,6 +124,32 @@ function createDiscordBot({ supabase }) {
     }
   });
 
+  // Dedicated trap-channel rule: ban any account that posts there. This is intentionally
+  // channel-scoped and runs before the bot-account filter so spam bots are included.
+  client.on('messageCreate', async message => {
+    const autoBanChannelId = String(runtimeSettings.auto_ban_channel_id || '').trim();
+    if (!autoBanChannelId || !message.guild || message.channelId !== autoBanChannelId || message.author.id === client.user?.id) return;
+    const key = `${message.guild.id}:${message.author.id}`;
+    const now = Date.now();
+    if (now - (autoBanActionAt.get(key) || 0) < 15000) return;
+    autoBanActionAt.set(key, now);
+    try { await message.delete(); } catch (error) { console.warn('[Anti-spam] Could not remove trap-channel message:', error.message); }
+    try {
+      const member = await message.guild.members.fetch(message.author.id).catch(() => null);
+      if (member && !member.bannable) {
+        console.warn(`[Anti-spam] Auto-ban blocked for ${message.author.id}: bot lacks Ban Members permission or target role is too high.`);
+        return;
+      }
+      await message.guild.members.ban(message.author.id, {
+        reason: `Automatic ban: posted in designated spam trap channel ${autoBanChannelId}`,
+        deleteMessageSeconds: 0
+      });
+      console.log(`[Anti-spam] Banned ${message.author.id} after posting in trap channel ${autoBanChannelId}.`);
+    } catch (error) {
+      console.error(`[Anti-spam] Could not auto-ban ${message.author.id}:`, error.message);
+    }
+  });
+
   // Burst limiter: count guild messages without reading message content. No Message Content
   // privileged intent is needed. The bot deletes the triggering message and times out spam.
   client.on('messageCreate', async message => {
@@ -148,6 +185,7 @@ function createDiscordBot({ supabase }) {
     try {
       if (interaction.isChatInputCommand() && interaction.commandName === 'control') {
         if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'คำสั่งนี้ใช้ได้เฉพาะเจ้าของเซิร์ฟเวอร์หรือแอดมินเท่านั้น', ephemeral: true });
+        await refreshRuntimeSettings();
         return interaction.reply({ content: 'HSH SovereignSoul • Verify Control', components: controlRows(), ephemeral: true });
       }
 
@@ -166,6 +204,10 @@ function createDiscordBot({ supabase }) {
           return showGuides(interaction, interaction.customId.endsWith(':en') ? 'en' : 'th');
         }
         if (interaction.customId === `${PREFIX}control:publish`) return interaction.showModal(publishModal());
+        if (interaction.customId === `${PREFIX}control:community`) {
+          if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
+          return interaction.showModal(communitySettingsModal(runtimeSettings));
+        }
         const guideMatch = interaction.customId.match(/^hsh:control:guide:(th|en):([1-3])$/);
         if (guideMatch) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
@@ -174,6 +216,10 @@ function createDiscordBot({ supabase }) {
       }
 
       if (interaction.isModalSubmit()) {
+        if (interaction.customId === `${PREFIX}community-settings`) {
+          if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
+          return saveCommunitySettings(interaction);
+        }
         if (interaction.customId === `${PREFIX}publish`) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
           return publishPanel(interaction);
@@ -213,6 +259,9 @@ function createDiscordBot({ supabase }) {
     const rows = [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`${PREFIX}control:publish`).setLabel('ตั้งค่าห้องและโพสต์ปุ่ม Verify').setStyle(ButtonStyle.Primary)
     )];
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`${PREFIX}control:community`).setLabel('ตั้งค่า Welcome / Goodbye / Auto-ban').setStyle(ButtonStyle.Success)
+    ));
     for (const lang of ['th', 'en']) {
       for (let step = 1; step <= 3; step++) {
         const label = `${lang === 'th' ? 'TH' : 'EN'} • Guide ${step}`;
@@ -264,6 +313,82 @@ function createDiscordBot({ supabase }) {
       .addComponents(modalRow('channel_id', 'Channel ID ที่จะโพสต์ปุ่ม', TextInputStyle.Short, true, 'คลิกขวาห้อง > Copy Channel ID', 25));
   }
 
+  function communitySettingsModal(settings) {
+    return new ModalBuilder().setCustomId(`${PREFIX}community-settings`).setTitle('ตั้งค่าห้องและข้อความ')
+      .addComponents(
+        modalRow('welcome_channel_id', 'Welcome Channel ID (ว่าง = ปิด)', TextInputStyle.Short, false, 'ID ห้องข้อความ', 25, settings.welcome_channel_id || ''),
+        modalRow('welcome_message', 'Welcome Message', TextInputStyle.Paragraph, false, 'เช่น ยินดีต้อนรับ {user} สู่ {server}!', 1000, settings.welcome_message || ''),
+        modalRow('goodbye_channel_id', 'Goodbye Channel ID (ว่าง = ปิด)', TextInputStyle.Short, false, 'ID ห้องข้อความ', 25, settings.goodbye_channel_id || ''),
+        modalRow('goodbye_message', 'Goodbye Message', TextInputStyle.Paragraph, false, 'เช่น {user} ออกจาก {server} แล้ว', 1000, settings.goodbye_message || ''),
+        modalRow('auto_ban_channel_id', 'Auto-ban Channel ID (ว่าง = ปิด)', TextInputStyle.Short, false, 'ID ห้องกับดักสแปม', 25, settings.auto_ban_channel_id || '')
+      );
+  }
+
+  async function saveCommunitySettings(interaction) {
+    const values = {
+      welcome_channel_id: interaction.fields.getTextInputValue('welcome_channel_id').trim(),
+      welcome_message: interaction.fields.getTextInputValue('welcome_message').trim(),
+      goodbye_channel_id: interaction.fields.getTextInputValue('goodbye_channel_id').trim(),
+      goodbye_message: interaction.fields.getTextInputValue('goodbye_message').trim(),
+      auto_ban_channel_id: interaction.fields.getTextInputValue('auto_ban_channel_id').trim(),
+      updated_at: new Date().toISOString()
+    };
+    for (const key of ['welcome_channel_id', 'goodbye_channel_id', 'auto_ban_channel_id']) {
+      if (values[key] && !/^\d{17,20}$/.test(values[key])) return interaction.reply({ content: `${key} ต้องเป็น Channel ID ตัวเลข 17–20 หลัก หรือเว้นว่างเพื่อปิด`, ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    for (const key of ['welcome_channel_id', 'goodbye_channel_id']) {
+      if (!values[key]) continue;
+      const channel = await interaction.guild.channels.fetch(values[key]).catch(() => null);
+      if (!channel?.isTextBased() || !channel.send) return interaction.editReply({ content: `ไม่พบห้องข้อความสำหรับ ${key} หรือบอทส่งข้อความในห้องนั้นไม่ได้` });
+    }
+    await saveDiscordSettings(values);
+    await refreshRuntimeSettings();
+    return interaction.editReply({ content: 'บันทึกแล้ว ข้อความรองรับ {user}, {server}, {memberCount}; เว้น Channel ID เพื่อปิดระบบนั้น' });
+  }
+
+  async function refreshRuntimeSettings() {
+    const { data, error } = await supabase.from('discord_settings')
+      .select('auto_ban_channel_id,welcome_channel_id,welcome_message,goodbye_channel_id,goodbye_message')
+      .eq('id', 1).maybeSingle();
+    if (error) {
+      console.error('[Discord] Could not load control settings:', error.message);
+      return;
+    }
+    runtimeSettings = data || {};
+    if (runtimeSettings.auto_ban_channel_id) {
+      console.log(`[Anti-spam] Channel auto-ban enabled for channel ${runtimeSettings.auto_ban_channel_id}; bot needs Ban Members permission and a higher role than targets.`);
+    } else {
+      console.log('[Anti-spam] Channel auto-ban disabled; configure it in /control.');
+    }
+  }
+
+  async function saveDiscordSettings(patch) {
+    const table = supabase.from('discord_settings');
+    const { data: current, error: readError } = await table.select('id').eq('id', 1).maybeSingle();
+    if (readError) throw readError;
+    const result = current
+      ? await table.update(patch).eq('id', 1)
+      : await table.insert({ id: 1, ...patch });
+    if (result.error) throw result.error;
+  }
+
+  async function sendConfiguredMemberMessage(member, type) {
+    try {
+      const channelId = runtimeSettings[`${type}_channel_id`];
+      const template = String(runtimeSettings[`${type}_message`] || '').trim();
+      if (!channelId || !template) return;
+      const channel = await member.guild.channels.fetch(channelId).catch(() => null);
+      if (!channel?.isTextBased() || !channel.send) return;
+      const text = template.replaceAll('{user}', `<@${member.id}>`)
+        .replaceAll('{server}', member.guild.name)
+        .replaceAll('{memberCount}', String(member.guild.memberCount));
+      await channel.send({ content: text, allowedMentions: { users: [member.id], parse: [] } });
+    } catch (error) {
+      console.error(`[Discord] Could not send ${type} message for ${member.id}:`, error.message);
+    }
+  }
+
   function guideModal(lang, step) {
     const langName = lang === 'th' ? 'ไทย' : 'English';
     return new ModalBuilder().setCustomId(`${PREFIX}guide-edit:${lang}:${step}`).setTitle(`Guide ${langName} • ${step}/3`)
@@ -279,11 +404,9 @@ function createDiscordBot({ supabase }) {
     await interaction.deferReply({ ephemeral: true });
     const channel = await interaction.guild.channels.fetch(channelId);
     if (!channel || !channel.isTextBased() || !channel.send) return interaction.editReply({ content: 'ไม่พบห้องข้อความนี้ หรือบอทส่งข้อความในห้องไม่ได้' });
-    const { error: saveError } = await supabase.from('discord_settings').upsert({ id: 1, verify_channel_id: channelId, updated_at: new Date().toISOString() }, { onConflict: 'id' });
-    if (saveError) throw saveError;
+    await saveDiscordSettings({ verify_channel_id: channelId, updated_at: new Date().toISOString() });
     const message = await channel.send(verifyPanel());
-    const { error: updateError } = await supabase.from('discord_settings').update({ verify_message_id: message.id, updated_at: new Date().toISOString() }).eq('id', 1);
-    if (updateError) throw updateError;
+    await saveDiscordSettings({ verify_message_id: message.id, updated_at: new Date().toISOString() });
     return interaction.editReply({ content: `โพสต์ปุ่ม Verify แล้วใน ${channel}` });
   }
 
