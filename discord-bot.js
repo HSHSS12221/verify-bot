@@ -62,9 +62,6 @@ function createDiscordBot({ supabase }) {
     } catch (error) {
       console.error('[Discord] Could not register /control:', error.message);
     }
-    if (!/^\d{17,20}$/.test(process.env.DISCORD_JOIN_TO_CREATE_CHANNEL_ID || '')) {
-      console.log('[Voice] Join-to-create disabled; configure DISCORD_JOIN_TO_CREATE_CHANNEL_ID to a voice channel ID.');
-    }
     await refreshRuntimeSettings();
   });
 
@@ -78,12 +75,12 @@ function createDiscordBot({ supabase }) {
   // Create a private-to-owner voice room when a member joins the configured lobby.
   // Empty rooms created by the bot are removed automatically.
   client.on('voiceStateUpdate', async (oldState, newState) => {
-    const createChannelId = process.env.DISCORD_JOIN_TO_CREATE_CHANNEL_ID;
+    const createChannelId = String(runtimeSettings.voice_lobby_channel_id || '').trim();
     if (!createChannelId || newState.channelId !== createChannelId || oldState.channelId === createChannelId) return;
     try {
       const guild = newState.guild;
-      const categoryId = process.env.DISCORD_VOICE_CATEGORY_ID || newState.channel?.parentId || null;
-      const requestedLimit = Number(process.env.DISCORD_CREATED_VOICE_LIMIT || 8);
+      const categoryId = runtimeSettings.voice_category_id || newState.channel?.parentId || null;
+      const requestedLimit = Number(runtimeSettings.voice_user_limit ?? 8);
       const userLimit = Number.isInteger(requestedLimit) && requestedLimit >= 0 && requestedLimit <= 99 ? requestedLimit : 8;
       const baseName = (newState.member?.displayName || newState.member?.user?.username || 'Player').replace(/[\\/:*?"<>|]/g, '').slice(0, 80);
       const room = await guild.channels.create({
@@ -109,7 +106,7 @@ function createDiscordBot({ supabase }) {
 
   client.on('voiceStateUpdate', async (oldState, newState) => {
     const channel = oldState.channel;
-    if (!channel || channel.id === process.env.DISCORD_JOIN_TO_CREATE_CHANNEL_ID) return;
+    if (!channel || channel.id === runtimeSettings.voice_lobby_channel_id) return;
     // Delete only rooms created by this running bot process.
     if (!managedVoiceRooms.has(channel.id)) return;
     try {
@@ -208,6 +205,10 @@ function createDiscordBot({ supabase }) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
           return interaction.showModal(communitySettingsModal(runtimeSettings));
         }
+        if (interaction.customId === `${PREFIX}control:voice`) {
+          if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
+          return interaction.showModal(voiceSettingsModal(runtimeSettings));
+        }
         const guideMatch = interaction.customId.match(/^hsh:control:guide:(th|en):([1-3])$/);
         if (guideMatch) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
@@ -219,6 +220,10 @@ function createDiscordBot({ supabase }) {
         if (interaction.customId === `${PREFIX}community-settings`) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
           return saveCommunitySettings(interaction);
+        }
+        if (interaction.customId === `${PREFIX}voice-settings`) {
+          if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
+          return saveVoiceSettings(interaction);
         }
         if (interaction.customId === `${PREFIX}publish`) {
           if (!isAdmin(interaction, adminRoleIds)) return interaction.reply({ content: 'เฉพาะ owner/admin เท่านั้น', ephemeral: true });
@@ -257,7 +262,8 @@ function createDiscordBot({ supabase }) {
 
   function controlRows() {
     const rows = [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`${PREFIX}control:publish`).setLabel('ตั้งค่าห้องและโพสต์ปุ่ม Verify').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId(`${PREFIX}control:publish`).setLabel('ตั้งค่าห้องและโพสต์ปุ่ม Verify').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`${PREFIX}control:voice`).setLabel('ตั้งค่า Join-to-Create').setStyle(ButtonStyle.Primary)
     )];
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`${PREFIX}control:community`).setLabel('ตั้งค่า Welcome / Goodbye / Auto-ban').setStyle(ButtonStyle.Success)
@@ -324,6 +330,46 @@ function createDiscordBot({ supabase }) {
       );
   }
 
+  function voiceSettingsModal(settings) {
+    return new ModalBuilder().setCustomId(`${PREFIX}voice-settings`).setTitle('ตั้งค่า Join-to-Create')
+      .addComponents(
+        modalRow('voice_lobby_channel_id', 'ห้องรอ Join-to-Create (ว่าง = ปิด)', TextInputStyle.Short, false, 'Voice Channel ID', 25, settings.voice_lobby_channel_id || ''),
+        modalRow('voice_category_id', 'หมวดหมู่ห้องใหม่ (ไม่ใส่ = ใช้หมวด lobby)', TextInputStyle.Short, false, 'Category ID', 25, settings.voice_category_id || ''),
+        modalRow('voice_user_limit', 'จำนวนคนต่อห้อง (0–99, 0 = ไม่จำกัด)', TextInputStyle.Short, false, '8', 2, String(settings.voice_user_limit ?? 8))
+      );
+  }
+
+  async function saveVoiceSettings(interaction) {
+    const values = {
+      voice_lobby_channel_id: interaction.fields.getTextInputValue('voice_lobby_channel_id').trim(),
+      voice_category_id: interaction.fields.getTextInputValue('voice_category_id').trim(),
+      voice_user_limit: Number(interaction.fields.getTextInputValue('voice_user_limit').trim() || 8),
+      updated_at: new Date().toISOString()
+    };
+    for (const key of ['voice_lobby_channel_id', 'voice_category_id']) {
+      if (values[key] && !/^\d{17,20}$/.test(values[key])) return interaction.reply({ content: `${key} ต้องเป็น Channel ID ตัวเลข 17–20 หลัก หรือเว้นว่าง`, ephemeral: true });
+    }
+    if (!Number.isInteger(values.voice_user_limit) || values.voice_user_limit < 0 || values.voice_user_limit > 99) {
+      return interaction.reply({ content: 'จำนวนคนต้องเป็นเลข 0–99 (ใส่ 0 เพื่อไม่จำกัด)', ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    if (values.voice_lobby_channel_id) {
+      const lobby = await interaction.guild.channels.fetch(values.voice_lobby_channel_id).catch(() => null);
+      if (!lobby || ![ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(lobby.type)) {
+        return interaction.editReply({ content: 'ไม่พบ Voice Channel ที่ระบุ หรือบอทเข้าไม่ถึงห้องนั้น' });
+      }
+    }
+    if (values.voice_category_id) {
+      const category = await interaction.guild.channels.fetch(values.voice_category_id).catch(() => null);
+      if (!category || category.type !== ChannelType.GuildCategory) return interaction.editReply({ content: 'ไม่พบหมวดหมู่ Category ที่ระบุ' });
+    }
+    await saveDiscordSettings(values);
+    await refreshRuntimeSettings();
+    return interaction.editReply({ content: values.voice_lobby_channel_id
+      ? 'บันทึกแล้ว สมาชิกที่เข้าห้อง lobby นี้จะได้ห้องเสียงส่วนตัวชั่วคราว'
+      : 'ปิด Join-to-Create แล้ว (เว้น Channel ID ว่าง)' });
+  }
+
   async function saveCommunitySettings(interaction) {
     const values = {
       welcome_channel_id: interaction.fields.getTextInputValue('welcome_channel_id').trim(),
@@ -349,7 +395,7 @@ function createDiscordBot({ supabase }) {
 
   async function refreshRuntimeSettings() {
     const { data, error } = await supabase.from('discord_settings')
-      .select('auto_ban_channel_id,welcome_channel_id,welcome_message,goodbye_channel_id,goodbye_message')
+      .select('auto_ban_channel_id,welcome_channel_id,welcome_message,goodbye_channel_id,goodbye_message,voice_lobby_channel_id,voice_category_id,voice_user_limit')
       .eq('id', 1).maybeSingle();
     if (error) {
       console.error('[Discord] Could not load control settings:', error.message);
