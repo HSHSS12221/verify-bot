@@ -5,6 +5,7 @@ const {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  ChannelType,
   ModalBuilder,
   REST,
   Routes,
@@ -28,7 +29,20 @@ function createDiscordBot({ supabase }) {
     return null;
   }
 
-  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  const client = new Client({ intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates
+  ] });
+  const verifyMaxAttempts = positiveInt(process.env.DISCORD_VERIFY_MAX_ATTEMPTS, 8);
+  const verifyWindowHours = positiveInt(process.env.DISCORD_VERIFY_WINDOW_HOURS, 24);
+  const spamMaxMessages = positiveInt(process.env.DISCORD_SPAM_MAX_MESSAGES, 6);
+  const spamWindowMs = positiveInt(process.env.DISCORD_SPAM_WINDOW_SECONDS, 5) * 1000;
+  const spamTimeoutSteps = parseTimeoutSteps(process.env.DISCORD_SPAM_TIMEOUT_STEPS_SECONDS);
+  const spamStrikeResetDays = positiveInt(process.env.DISCORD_SPAM_STRIKE_RESET_DAYS, 30);
+  const messageWindows = new Map();
+  const spamActionAt = new Map();
+  const managedVoiceRooms = new Set();
   client.sendWhitelistApprovedDM = async discordId => {
     if (!/^\d{17,20}$/.test(String(discordId || ''))) throw new Error('Discord ID is invalid');
     const user = await client.users.fetch(String(discordId));
@@ -45,6 +59,89 @@ function createDiscordBot({ supabase }) {
     } catch (error) {
       console.error('[Discord] Could not register /control:', error.message);
     }
+    if (!/^\d{17,20}$/.test(process.env.DISCORD_JOIN_TO_CREATE_CHANNEL_ID || '')) {
+      console.log('[Voice] Join-to-create disabled; configure DISCORD_JOIN_TO_CREATE_CHANNEL_ID to a voice channel ID.');
+    }
+  });
+
+  // Create a private-to-owner voice room when a member joins the configured lobby.
+  // Empty rooms created by the bot are removed automatically.
+  client.on('voiceStateUpdate', async (oldState, newState) => {
+    const createChannelId = process.env.DISCORD_JOIN_TO_CREATE_CHANNEL_ID;
+    if (!createChannelId || newState.channelId !== createChannelId || oldState.channelId === createChannelId) return;
+    try {
+      const guild = newState.guild;
+      const categoryId = process.env.DISCORD_VOICE_CATEGORY_ID || newState.channel?.parentId || null;
+      const requestedLimit = Number(process.env.DISCORD_CREATED_VOICE_LIMIT || 8);
+      const userLimit = Number.isInteger(requestedLimit) && requestedLimit >= 0 && requestedLimit <= 99 ? requestedLimit : 8;
+      const baseName = (newState.member?.displayName || newState.member?.user?.username || 'Player').replace(/[\\/:*?"<>|]/g, '').slice(0, 80);
+      const room = await guild.channels.create({
+        name: `🎙️ ${baseName}`,
+        type: ChannelType.GuildVoice,
+        ...(categoryId ? { parent: categoryId } : {}),
+        userLimit,
+        reason: `Join-to-create room for ${newState.id}`
+      });
+      managedVoiceRooms.add(room.id);
+      try {
+        await newState.setChannel(room, 'Join-to-create room');
+      } catch (error) {
+        managedVoiceRooms.delete(room.id);
+        await room.delete('Could not move member into Join-to-create room').catch(() => {});
+        throw error;
+      }
+      console.log(`[Voice] Created ${room.id} for member ${newState.id}`);
+    } catch (error) {
+      console.error(`[Voice] Could not create/move member ${newState.id}:`, error.message);
+    }
+  });
+
+  client.on('voiceStateUpdate', async (oldState, newState) => {
+    const channel = oldState.channel;
+    if (!channel || channel.id === process.env.DISCORD_JOIN_TO_CREATE_CHANNEL_ID) return;
+    // Delete only rooms created by this running bot process.
+    if (!managedVoiceRooms.has(channel.id)) return;
+    try {
+      const fresh = await channel.fetch();
+      if (fresh.members.size === 0) {
+        await fresh.delete('Join-to-create room is empty');
+        managedVoiceRooms.delete(channel.id);
+        console.log(`[Voice] Deleted empty room ${channel.id}`);
+      }
+    } catch (error) {
+      if (error.code !== 10003) console.error(`[Voice] Could not remove empty room ${channel.id}:`, error.message);
+    }
+  });
+
+  // Burst limiter: count guild messages without reading message content. No Message Content
+  // privileged intent is needed. The bot deletes the triggering message and times out spam.
+  client.on('messageCreate', async message => {
+    if (!message.guild || message.author.bot) return;
+    const now = Date.now();
+    const key = `${message.guild.id}:${message.author.id}`;
+    const timestamps = (messageWindows.get(key) || []).filter(time => now - time < spamWindowMs);
+    timestamps.push(now);
+    messageWindows.set(key, timestamps);
+    if (timestamps.length <= spamMaxMessages || now - (spamActionAt.get(key) || 0) < spamWindowMs) return;
+    spamActionAt.set(key, now);
+    try { await message.delete(); } catch (error) { console.warn('[Anti-spam] Could not delete message:', error.message); }
+    try {
+      const { data: strike, error: strikeError } = await supabase.rpc('register_discord_spam_strike', {
+        p_guild_id: message.guild.id,
+        p_discord_id: message.author.id,
+        p_reset_days: spamStrikeResetDays
+      });
+      if (strikeError) throw strikeError;
+      const strikeCount = Number(strike) || 1;
+      const timeoutSeconds = spamTimeoutSteps[Math.min(strikeCount - 1, spamTimeoutSteps.length - 1)];
+      const member = message.member || await message.guild.members.fetch(message.author.id);
+      if (member.moderatable) {
+        await member.timeout(timeoutSeconds * 1000, `Automatic timeout: message burst spam (strike ${strikeCount})`);
+      } else {
+        console.warn(`[Anti-spam] Member ${message.author.id} cannot be timed out; check bot role hierarchy and Moderate Members permission.`);
+      }
+      console.log(`[Anti-spam] Rate limited ${message.author.id}; strike ${strikeCount}, timeout ${timeoutSeconds}s`);
+    } catch (error) { console.warn('[Anti-spam] Could not timeout member:', error.message); }
   });
 
   client.on('interactionCreate', async interaction => {
@@ -225,6 +322,18 @@ function createDiscordBot({ supabase }) {
     if (submittedDiscordId !== interaction.user.id) return interaction.reply({ content: english ? 'Discord ID must match your signed-in Discord account.' : 'Discord ID ต้องตรงกับบัญชี Discord ที่กำลังกดปุ่ม', ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
 
+    const { data: attemptAllowed, error: attemptError } = await supabase.rpc('consume_discord_verify_attempt', {
+      p_discord_id: interaction.user.id,
+      p_max_attempts: verifyMaxAttempts,
+      p_window_hours: verifyWindowHours
+    });
+    if (attemptError) throw attemptError;
+    if (attemptAllowed !== true) {
+      return interaction.editReply({ content: english
+        ? `You have reached the limit of ${verifyMaxAttempts} verification attempts. Try again after ${verifyWindowHours} hours.`
+        : `คุณส่งคำขอยืนยันครบ ${verifyMaxAttempts} ครั้งแล้ว กรุณาลองใหม่หลัง ${verifyWindowHours} ชั่วโมง` });
+    }
+
     const { data: existing, error: existingError } = await supabase.from('whitelists').select('id,status').eq('steam_id', steamId).maybeSingle();
     if (existingError) throw existingError;
     if (existing && ['approved', 'banned'].includes(existing.status)) {
@@ -255,6 +364,20 @@ function createDiscordBot({ supabase }) {
         : 'ส่งข้อมูลยืนยันแล้ว สถานะ Pending รอแอดมินอนุมัติ จากนั้น Launcher จึงจะเข้าเกมได้'
     });
   }
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseTimeoutSteps(value) {
+  const defaultSteps = '300,900,3600,10800,21600,43200,86400,259200,604800,1209600,2419200';
+  const parsed = String(value || defaultSteps)
+    .split(',')
+    .map(part => Number.parseInt(part.trim(), 10))
+    .filter(seconds => Number.isInteger(seconds) && seconds > 0 && seconds <= 2_419_200);
+  return parsed.length ? parsed : defaultSteps.split(',').map(Number);
 }
 
 module.exports = { createDiscordBot };
