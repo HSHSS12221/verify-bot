@@ -326,9 +326,9 @@ function createDiscordBot({ supabase }) {
   }
 
   function modalRow(id, label, style, required, placeholder, maxLength, value) {
-    const input = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setRequired(required).setMaxLength(maxLength);
+    const input = new TextInputBuilder().setCustomId(id).setLabel(String(label).slice(0, 45)).setStyle(style).setRequired(required).setMaxLength(maxLength);
     if (placeholder) input.setPlaceholder(placeholder);
-    if (value) input.setValue(value);
+    if (value) input.setValue(String(value).slice(0, maxLength));
     return new ActionRowBuilder().addComponents(input);
   }
 
@@ -342,8 +342,8 @@ function createDiscordBot({ supabase }) {
     return new ModalBuilder().setCustomId(`${PREFIX}${type}-settings`).setTitle(title)
       .addComponents(
         modalRow('channel_id', 'Channel ID (เว้นว่างเพื่อปิด)', TextInputStyle.Short, false, 'ID ห้องข้อความ', 25, settings[`${type}_channel_id`] || ''),
-        modalRow('message', 'ข้อความ (รองรับ {user}, {server}, {memberCount})', TextInputStyle.Paragraph, false, type === 'welcome' ? 'ยินดีต้อนรับ {user} สู่ {server}!' : '{user} ออกจาก {server} แล้ว', 1000, settings[`${type}_message`] || ''),
-        modalRow('image_url', 'ลิงก์รูปภาพ HTTPS (ไม่ใส่ก็ได้)', TextInputStyle.Short, false, 'https://example.com/image.png', 500, settings[`${type}_image_url`] || '')
+        modalRow('message', 'ข้อความ', TextInputStyle.Paragraph, false, 'รองรับ {user}, {server}, {memberCount}', 1000, settings[`${type}_message`] || ''),
+        modalRow('image_url', 'ลิงก์รูป HTTPS', TextInputStyle.Short, false, 'ลิงก์รูปภาพ (ไม่บังคับ)', 2000, settings[`${type}_image_url`] || '')
       );
   }
 
