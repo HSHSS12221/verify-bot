@@ -17,6 +17,14 @@ if (!discord) throw new Error('Discord bot failed to initialize');
 const app = express();
 app.use(express.json({ limit: '32kb' }));
 app.get('/health', (_req, res) => res.json({ ok: true, discord_ready: discord.isReady() }));
+app.get('/public/verify-link', async (_req, res, next) => {
+  try {
+    const { data, error } = await supabase.from('discord_settings').select('verify_channel_id').eq('id', 1).maybeSingle();
+    if (error) throw error;
+    if (!data?.verify_channel_id) return res.status(404).json({ error: 'Verification channel has not been configured with /control.' });
+    res.set('Cache-Control', 'no-store').json({ url: `https://discord.com/channels/${process.env.DISCORD_GUILD_ID}/${data.verify_channel_id}` });
+  } catch (error) { next(error); }
+});
 app.post('/internal/approved', async (req, res) => {
   if (!validWebhookSecret(req.get('authorization'))) return res.status(401).json({ error: 'Unauthorized' });
   const discordId = String(req.body.discord_id || '').trim();
